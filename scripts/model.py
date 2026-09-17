@@ -1,17 +1,17 @@
-"""
-model.py
+"""model.py
 
-PyTorch model architectures and Dataset/DataLoader utilities for
-NeuralStock demand forecasting.
+PyTorch architectures and Dataset / DataLoader utilities for NeuralStock.
 
-Two models are provided:
-    - DemandLSTM: a stacked LSTM that consumes a sliding window of past
-      observations per product (sequence forecasting).
-    - DemandMLP: a feedforward baseline that consumes a single row of
-      engineered features (no explicit sequence modelling) — used to show
-      the LSTM's improvement over a simpler architecture.
+Two models:
+    * :class:`DemandLSTM` - a stacked LSTM over a sliding window of past
+      daily feature rows for one SKU (sequence forecasting).
+    * :class:`DemandMLP` - a feedforward baseline over a single engineered
+      feature row, used to show what the sequence model buys us.
 
-Requires: torch >= 2.0 (install via requirements.txt: `pip install torch`).
+Both datasets return the same ``(X, y, baseline, row_index)`` tuple shape, so
+the same training and evaluation code drives either one, and predictions can
+always be joined back to their ``date`` / ``product_category`` for the weekly
+aggregation the brief scores on.
 """
 
 from __future__ import annotations
@@ -29,10 +29,10 @@ RANDOM_SEED = 42
 
 
 def set_seeds(seed: int = RANDOM_SEED) -> None:
-    """Set python, numpy, and torch random seeds for reproducibility.
+    """Set python, numpy and torch seeds for reproducibility.
 
     Args:
-        seed: The seed value to apply everywhere.
+        seed: Seed value applied everywhere.
 
     Returns:
         None.
@@ -45,37 +45,32 @@ def set_seeds(seed: int = RANDOM_SEED) -> None:
 
 
 class SlidingWindowDataset(Dataset):
-    """Builds fixed-length sliding windows of features per product_id.
+    """Fixed-length sliding windows of feature rows, per SKU.
 
-    Each sample is a (sequence_length, n_features) window of past feature
-    rows for a single SKU, paired with a target for the row immediately
-    following the window, and a baseline value for that same row. Windows
-    never cross product_id boundaries.
+    Each sample is a ``(sequence_length, n_features)`` window of consecutive
+    daily rows for one SKU, paired with the target of the row immediately
+    after the window. Windows never cross a ``product_id`` boundary.
 
-    By default (predict_residual=True) the target handed to the model is
-    `units_sold - roll_mean_7_raw` rather than raw units_sold. units_sold
-    has a much larger mean than variance across the series (~28 vs a
-    typical day-to-day swing of a few units), so training directly on it
-    lets an LSTM minimize MSE almost entirely by pushing its output bias
-    to the global mean while contributing near-zero from the recurrent
-    weights — the model "solves" training by memorizing a constant. The
-    residual is centered near zero regardless of a SKU's overall level,
-    which keeps gradients meaningful for the actual sequence weights. Add
-    the returned baseline back onto the model's output to recover a
-    real-units forecast (see train.py's evaluate()).
+    Residual targets
+    ----------------
+    With ``predict_residual=True`` the label is ``units_sold - roll_mean_7_raw``
+    rather than raw units. Daily demand has a large mean relative to its
+    day-to-day variation, so training on raw units lets the network minimise
+    MSE almost entirely by parking its output bias at the series mean and
+    contributing nothing from the recurrent weights. The residual is centred
+    near zero whatever a SKU's level, which keeps gradients flowing into the
+    sequence weights. Add ``baseline`` back onto the output to recover a
+    real-units forecast.
 
     Args:
-        df: Feature-engineered, scaled DataFrame sorted by product_id, date.
-            Must contain target_column and baseline_column UNSCALED even
-            if feature_columns are scaled (apply_scaler in preprocess.py
-            leaves both alone by design).
-        feature_columns: List of column names to use as model inputs.
+        df: Scaled, feature-engineered DataFrame sorted by product_id, date.
+            ``target_column`` and ``baseline_column`` must remain unscaled.
+        feature_columns: Column names used as model inputs.
         target_column: Name of the raw target column.
-        baseline_column: Name of the unscaled rolling-mean column used as
-            the residual baseline and as the naive-forecast comparator.
-        sequence_length: Number of past time steps per window.
-        predict_residual: If True (default), the label returned is
-            `target - baseline` instead of the raw target.
+        baseline_column: Unscaled rolling-mean column used as the residual
+            baseline and as the naive comparator.
+        sequence_length: Number of past daily steps per window.
+        predict_residual: If True, the label is ``target - baseline``.
     """
 
     def __init__(
@@ -90,75 +85,80 @@ class SlidingWindowDataset(Dataset):
         self.sequence_length = sequence_length
         self.feature_columns = feature_columns
         self.predict_residual = predict_residual
-        self.samples: List[Tuple[np.ndarray, float, float]] = []
 
-        for _, group in df.groupby("product_id"):
-            group = group.reset_index(drop=True)
+        windows, labels, baselines, indices = [], [], [], []
+        for _, group in df.groupby("product_id", sort=False):
+            group = group.sort_values("date")
+            row_ids = group.index.to_numpy()
             features = group[feature_columns].to_numpy(dtype=np.float32)
             targets = group[target_column].to_numpy(dtype=np.float32)
-            baselines = group[baseline_column].to_numpy(dtype=np.float32)
+            base = group[baseline_column].to_numpy(dtype=np.float32)
 
             for i in range(len(group) - sequence_length):
-                window = features[i : i + sequence_length]
-                target = targets[i + sequence_length]
-                baseline = baselines[i + sequence_length]
-                label = (target - baseline) if predict_residual else target
-                self.samples.append((window, label, baseline))
+                j = i + sequence_length
+                windows.append(features[i:j])
+                labels.append(targets[j] - base[j] if predict_residual else targets[j])
+                baselines.append(base[j])
+                indices.append(row_ids[j])
+
+        self.X = np.asarray(windows, dtype=np.float32)
+        self.y = np.asarray(labels, dtype=np.float32)
+        self.baseline = np.asarray(baselines, dtype=np.float32)
+        self.row_index = np.asarray(indices)
 
     def __len__(self) -> int:
         """Return the number of sliding-window samples.
 
         Returns:
-            Total sample count across all products.
+            Total sample count across all SKUs.
         """
-        return len(self.samples)
+        return len(self.X)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Fetch one (window, target, baseline) triple as tensors.
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor,
+                                             torch.Tensor, torch.Tensor]:
+        """Fetch one ``(window, label, baseline, row_index)`` sample.
 
         Args:
             idx: Sample index.
 
         Returns:
-            A tuple of (window tensor of shape [sequence_length, n_features],
-            scalar target tensor, scalar baseline tensor). The baseline is
-            the row's raw roll_mean_7 value regardless of predict_residual,
-            so callers can always reconstruct real-units predictions/targets
-            and compute the roll_mean_7 naive-forecast comparison.
+            A tuple of the window tensor ``[sequence_length, n_features]``,
+            the scalar label, the scalar real-units baseline, and the source
+            DataFrame row index for joining predictions back to date/category.
         """
-        window, label, baseline = self.samples[idx]
         return (
-            torch.from_numpy(window),
-            torch.tensor(label, dtype=torch.float32),
-            torch.tensor(baseline, dtype=torch.float32),
+            torch.from_numpy(self.X[idx]),
+            torch.tensor(self.y[idx], dtype=torch.float32),
+            torch.tensor(self.baseline[idx], dtype=torch.float32),
+            torch.tensor(int(self.row_index[idx]), dtype=torch.long),
         )
 
 
 class TabularDataset(Dataset):
-    """Wraps a single row of engineered features per sample (for the MLP baseline).
+    """One engineered feature row per sample, for the MLP baseline.
 
-    Unlike SlidingWindowDataset, the MLP is trained directly on the raw
-    target — its short, largely linear ReLU path from the lag/rolling
-    features to the output has no trouble learning the series' overall
-    level, so it doesn't need the residual trick. A baseline value is
-    still returned (unused in the MLP's own loss) purely so train.py can
-    report the roll_mean_7 naive-forecast comparison against the same
-    DataLoader, using the same tuple shape as SlidingWindowDataset.
+    Uses the identical target formulation as :class:`SlidingWindowDataset` so
+    the two models are compared on the same quantity - the original pipeline
+    trained the MLP on raw units and the LSTM on residuals, which made the
+    reported comparison meaningless.
 
     Args:
-        df: Feature-engineered, scaled DataFrame.
-        feature_columns: List of column names to use as model inputs.
-        target_column: Name of the target column (kept raw/unscaled).
-        baseline_column: Name of the unscaled rolling-mean column used
-            only for the naive-forecast comparison in train.py.
+        df: Scaled, feature-engineered DataFrame.
+        feature_columns: Column names used as model inputs.
+        target_column: Name of the raw target column.
+        baseline_column: Unscaled rolling-mean baseline column.
+        predict_residual: If True, the label is ``target - baseline``.
     """
 
     def __init__(self, df: pd.DataFrame, feature_columns: List[str],
                  target_column: str = "units_sold",
-                 baseline_column: str = "roll_mean_7_raw") -> None:
+                 baseline_column: str = "roll_mean_7_raw",
+                 predict_residual: bool = True) -> None:
         self.X = df[feature_columns].to_numpy(dtype=np.float32)
-        self.y = df[target_column].to_numpy(dtype=np.float32)
+        raw = df[target_column].to_numpy(dtype=np.float32)
         self.baseline = df[baseline_column].to_numpy(dtype=np.float32)
+        self.y = (raw - self.baseline) if predict_residual else raw
+        self.row_index = df.index.to_numpy()
 
     def __len__(self) -> int:
         """Return the number of rows.
@@ -168,40 +168,42 @@ class TabularDataset(Dataset):
         """
         return len(self.X)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Fetch one (features, target, baseline) triple as tensors.
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor,
+                                             torch.Tensor, torch.Tensor]:
+        """Fetch one ``(features, label, baseline, row_index)`` sample.
 
         Args:
             idx: Row index.
 
         Returns:
-            A tuple of (feature tensor, scalar raw-target tensor, scalar
-            baseline tensor).
+            A tuple of the feature tensor, scalar label, scalar baseline and
+            source DataFrame row index.
         """
         return (
             torch.from_numpy(self.X[idx]),
             torch.tensor(self.y[idx], dtype=torch.float32),
             torch.tensor(self.baseline[idx], dtype=torch.float32),
+            torch.tensor(int(self.row_index[idx]), dtype=torch.long),
         )
 
 
 class DemandLSTM(nn.Module):
-    """Stacked LSTM for sequence-based weekly demand forecasting.
+    """Stacked LSTM for sequence-based daily demand forecasting.
 
-    Architecture: 2-layer LSTM -> dropout -> linear head producing a single
-    scalar forecast. Hidden size and layer count are kept modest (64, 2)
-    since each SKU only has ~100-150 historical observations — a larger
-    network would overfit quickly on a sequence this short.
+    Architecture: 2-layer LSTM (hidden 96) -> dropout -> Linear(96, 32) ->
+    ReLU -> Linear(32, 1). Two layers and a modest hidden size are enough
+    here: each SKU contributes ~700 daily observations, and a wider network
+    starts memorising the training period within a handful of epochs.
 
     Args:
         input_size: Number of features per time step.
-        hidden_size: LSTM hidden state dimensionality.
+        hidden_size: LSTM hidden-state width.
         num_layers: Number of stacked LSTM layers.
         dropout: Dropout probability between LSTM layers and before the head.
     """
 
-    def __init__(self, input_size: int, hidden_size: int = 64,
-                 num_layers: int = 2, dropout: float = 0.2) -> None:
+    def __init__(self, input_size: int, hidden_size: int = 96,
+                 num_layers: int = 2, dropout: float = 0.3) -> None:
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -211,32 +213,36 @@ class DemandLSTM(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_size, 1)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run a forward pass.
 
         Args:
-            x: Input tensor of shape [batch, sequence_length, input_size].
+            x: Input tensor of shape ``[batch, sequence_length, input_size]``.
 
         Returns:
-            Tensor of shape [batch] with the predicted units_sold.
+            Tensor of shape ``[batch]`` with the predicted value (a residual
+            when the dataset was built with ``predict_residual=True``).
         """
-        out, (h_n, _) = self.lstm(x)
-        last_hidden = h_n[-1]  # final layer's last hidden state: [batch, hidden]
-        last_hidden = self.dropout(last_hidden)
+        _, (h_n, _) = self.lstm(x)
+        last_hidden = self.dropout(h_n[-1])
         return self.head(last_hidden).squeeze(-1)
 
 
 class DemandMLP(nn.Module):
-    """Feedforward baseline model operating on a single engineered feature row.
+    """Feedforward baseline over a single engineered feature row.
 
-    Architecture: 3 hidden layers (128 -> 64 -> 32) with ReLU activations
-    and dropout, ending in a single-unit regression head.
+    Architecture: Linear(128) -> ReLU -> Dropout -> Linear(64) -> ReLU ->
+    Dropout -> Linear(32) -> ReLU -> Linear(1).
 
     Args:
         input_size: Number of input features.
-        dropout: Dropout probability after each hidden layer.
+        dropout: Dropout probability after the first two hidden layers.
     """
 
     def __init__(self, input_size: int, dropout: float = 0.2) -> None:
@@ -257,9 +263,9 @@ class DemandMLP(nn.Module):
         """Run a forward pass.
 
         Args:
-            x: Input tensor of shape [batch, input_size].
+            x: Input tensor of shape ``[batch, input_size]``.
 
         Returns:
-            Tensor of shape [batch] with the predicted units_sold.
+            Tensor of shape ``[batch]`` with the predicted value.
         """
         return self.net(x).squeeze(-1)

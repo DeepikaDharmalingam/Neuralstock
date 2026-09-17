@@ -1,30 +1,8 @@
-# Byte-compiled / cache
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Environments / secrets
 .env
-.venv/
 venv/
-*.env.local
-
-# Jupyter
 .ipynb_checkpoints/
-
-# TensorBoard logs
 runs/
-
-# Large data & model artifacts (comment out if you want to version them)
 data/*.csv
-!data/.gitkeep
-models/*.pt
-models/*.pkl
-
-# OS / editor
-.DS_Store
-.idea/
-.vscode/
-
-# Streamlit
-.streamlit/
+!data/ecommerce_inventory_demand.csv
