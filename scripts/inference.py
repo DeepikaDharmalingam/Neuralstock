@@ -71,7 +71,7 @@ def load_artifacts(models_dir: str = None) -> Tuple[DemandLSTM, object, List[str
 def prepare_features(raw_csv_path: str) -> pd.DataFrame:
     """Run the full feature-engineering pipeline (unscaled) on raw data.
 
-    Mirrors :func:`preprocess.run_pipeline` exactly up to the scaling step, so
+    Mirrors :func:preprocess.run_pipeline exactly up to the scaling step, so
     serving-time features are computed identically to training-time ones.
 
     Args:
@@ -137,8 +137,11 @@ def forecast_for_product(product_id: str, df: pd.DataFrame, model: DemandLSTM,
         prediction = max(0.0, baseline + residual)
 
         next_date = history["date"].iloc[-1] + pd.Timedelta(days=1)
+        # units_sold in the source data is always a whole number (units of
+        # stock), so the forecast is rounded to match that granularity
+        # instead of showing e.g. "7.42 units".
         predictions.append({"date": next_date,
-                            "predicted_units_sold": round(prediction, 2)})
+                            "predicted_units_sold": round(prediction)})
 
         next_row = history.iloc[-1].copy()
         next_row["date"] = next_date
@@ -166,7 +169,7 @@ def weekly_forecast(forecast: pd.DataFrame) -> pd.DataFrame:
     """Aggregate a daily forecast into weekly totals.
 
     Args:
-        forecast: Output of :func:`forecast_for_product`.
+        forecast: Output of :func:forecast_for_product.
 
     Returns:
         A DataFrame with ``week`` and ``forecast_units`` columns.
@@ -180,7 +183,7 @@ def reorder_alerts(forecast: pd.DataFrame, stock_on_hand: float,
     """Flag the weeks where projected stock falls through the reorder point.
 
     Args:
-        forecast: Output of :func:`forecast_for_product`.
+        forecast: Output of :func:forecast_for_product.
         stock_on_hand: Current opening inventory for the SKU.
         reorder_point: Replenishment threshold for the SKU.
 
